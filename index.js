@@ -704,7 +704,6 @@ async function uploadReel(filepath, caption = 'Reposted via bot 🤖', shortcode
     }
 }
 
-// Export functions for potential external use
 module.exports = {
     repostLatestReel,
     startRealTimeMonitoring,
@@ -715,7 +714,6 @@ module.exports = {
     checkForNewReels
 };
 
-// Run the bot if this file is executed directly
 if (require.main === module) {
     const targetUsername = 'ishowdailyvids'; // Change this to the target username
     
