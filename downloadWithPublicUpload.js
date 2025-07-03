@@ -11,13 +11,226 @@ const REELS_FOLDER = path.join(__dirname, 'reels');
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const IG_USER_ID = process.env.MY_IG_USER_ID || process.env.IG_USER_ID;
 
-// Import functions from the main script
-const {
-    extractShortcode,
-    getVideoDataFromPage,
-    downloadVideo,
-    saveCaptionData
-} = require('./downloadReelsFromFile.js');
+// Core Instagram processing functions
+function extractShortcode(url) {
+    try {
+        const regex = /(?:instagram\.com\/(?:p|reel)\/|instagr\.am\/p\/)([A-Za-z0-9_-]+)/;
+        const match = url.match(regex);
+        return match ? match[1] : null;
+    } catch (error) {
+        console.error('Error extracting shortcode:', error.message);
+        return null;
+    }
+}
+
+async function getVideoDataFromPage(shortcode) {
+    const url = `https://www.instagram.com/reel/${shortcode}/`;
+    const maxRetries = 3;
+    
+    const userAgents = [
+        'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36'
+    ];
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            console.log(`🔍 Scraping (attempt ${attempt}): ${url}`);
+            
+            const response = await axios.get(url, {
+                headers: {
+                    'User-Agent': userAgents[Math.floor(Math.random() * userAgents.length)],
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                },
+                timeout: 15000
+            });
+            
+            const $ = cheerio.load(response.data);
+            let videoUrl = null;
+            let caption = '';
+            
+            // Method 1: Extract from og:description meta tag
+            const ogDescription = $('meta[property="og:description"]').attr('content');
+            if (ogDescription) {
+                console.log('📝 Found caption via og:description');
+                caption = ogDescription;
+            }
+            
+            // Method 2: Extract from JSON-LD structured data
+            if (!caption) {
+                $('script[type="application/ld+json"]').each((i, elem) => {
+                    try {
+                        const jsonData = JSON.parse($(elem).html());
+                        if (jsonData.description) {
+                            console.log('📝 Found caption via JSON-LD');
+                            caption = jsonData.description;
+                            return false;
+                        }
+                    } catch (e) {}
+                });
+            }
+            
+            // Method 3: Extract video URL from inline JSON - Multiple patterns
+            const scriptTags = $('script').toArray();
+            for (const script of scriptTags) {
+                const scriptContent = $(script).html();
+                if (scriptContent && !videoUrl) {
+                    try {
+                        // Pattern 1: video_url
+                        let videoUrlMatch = scriptContent.match(/"video_url":"([^"]+)"/);
+                        if (videoUrlMatch) {
+                            videoUrl = videoUrlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                            console.log('✅ Found video URL via video_url pattern');
+                            break;
+                        }
+                        
+                        // Pattern 2: video_versions or video_resources
+                        videoUrlMatch = scriptContent.match(/"video_versions":\[{"url":"([^"]+)"/);
+                        if (videoUrlMatch) {
+                            videoUrl = videoUrlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                            console.log('✅ Found video URL via video_versions pattern');
+                            break;
+                        }
+                        
+                        // Pattern 3: playback_url
+                        videoUrlMatch = scriptContent.match(/"playback_url":"([^"]+)"/);
+                        if (videoUrlMatch) {
+                            videoUrl = videoUrlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                            console.log('✅ Found video URL via playback_url pattern');
+                            break;
+                        }
+                        
+                        // Pattern 4: Look for .mp4 URLs in general
+                        const mp4Matches = scriptContent.match(/https:[^"]*\.mp4[^"]*/g);
+                        if (mp4Matches && mp4Matches.length > 0) {
+                            // Get the longest URL (usually the highest quality)
+                            videoUrl = mp4Matches.reduce((longest, current) => 
+                                current.length > longest.length ? current : longest
+                            ).replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                            console.log('✅ Found video URL via mp4 pattern search');
+                            break;
+                        }
+                        
+                        // Pattern 5: Alternative JSON structure
+                        if (scriptContent.includes('shortcode_media')) {
+                            const jsonMatch = scriptContent.match(/window\._sharedData\s*=\s*({.*?});/);
+                            if (jsonMatch) {
+                                const sharedData = JSON.parse(jsonMatch[1]);
+                                const media = sharedData?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
+                                if (media?.video_url) {
+                                    videoUrl = media.video_url;
+                                    console.log('✅ Found video URL via shortcode_media');
+                                    break;
+                                }
+                            }
+                        }
+                        
+                    } catch (e) {
+                        // Continue to next script tag
+                    }
+                }
+            }
+            
+            if (videoUrl && caption) {
+                return { videoUrl, caption };
+            } else if (attempt < maxRetries) {
+                console.log(`⚠️ Incomplete data (video: ${!!videoUrl}, caption: ${!!caption}), retrying...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            } else if (attempt === maxRetries) {
+                // Save debug info on final attempt
+                console.log(`🔍 Saving debug info for ${shortcode}...`);
+                const debugFile = path.join(REELS_FOLDER, `debug_${shortcode}.txt`);
+                fs.writeFileSync(debugFile, response.data);
+                console.log(`💾 Debug HTML saved to debug_${shortcode}.txt`);
+            }
+            
+        } catch (error) {
+            console.error(`❌ Scraping attempt ${attempt} failed:`, error.message);
+            if (attempt < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+        }
+    }
+    
+    return null;
+}
+
+async function downloadVideo(videoUrl, shortcode) {
+    try {
+        console.log(`⬇️ Downloading ${shortcode}...`);
+        console.log(`🔗 Video URL: ${videoUrl.substring(0, 80)}...`);
+        
+        const response = await axios({
+            method: 'GET',
+            url: videoUrl,
+            responseType: 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
+            },
+            timeout: 60000
+        });
+        
+        const videoPath = path.join(REELS_FOLDER, `${shortcode}.mp4`);
+        const writer = fs.createWriteStream(videoPath);
+        
+        response.data.pipe(writer);
+        
+        return new Promise((resolve, reject) => {
+            let downloadedBytes = 0;
+            
+            response.data.on('data', (chunk) => {
+                downloadedBytes += chunk.length;
+            });
+            
+            writer.on('finish', () => {
+                const sizeKB = Math.round(downloadedBytes / 1024);
+                console.log(`✅ Downloaded: ${shortcode} (${sizeKB}KB)`);
+                resolve(videoPath);
+            });
+            
+            writer.on('error', reject);
+        });
+        
+    } catch (error) {
+        console.error(`❌ Download failed for ${shortcode}:`, error.message);
+        return null;
+    }
+}
+
+function saveCaptionData(shortcode, caption, originalUrl) {
+    try {
+        const captionsFile = path.join(REELS_FOLDER, 'captions.json');
+        let captions = {};
+        
+        // Load existing captions if file exists
+        if (fs.existsSync(captionsFile)) {
+            try {
+                captions = JSON.parse(fs.readFileSync(captionsFile, 'utf8'));
+            } catch (e) {
+                console.log('⚠️ Creating new captions file');
+            }
+        }
+        
+        // Add new caption data
+        captions[shortcode] = {
+            caption: caption,
+            originalUrl: originalUrl,
+            timestamp: new Date().toISOString()
+        };
+        
+        // Save back to file
+        fs.writeFileSync(captionsFile, JSON.stringify(captions, null, 2));
+        console.log(`💾 Caption saved for ${shortcode}`);
+        
+    } catch (error) {
+        console.error(`⚠️ Error saving caption for ${shortcode}:`, error.message);
+    }
+}
 
 // Read URLs from file (redefined locally)
 function readReelUrls() {
@@ -43,113 +256,41 @@ function readReelUrls() {
     }
 }
 
-// Upload video to temporary public hosting with multiple service fallbacks
+// Upload video to uguu.se public hosting
 async function uploadToPublicHosting(videoPath, shortcode) {
-    console.log(`🌐 Uploading ${shortcode} to public hosting...`);
+    console.log(`🌐 Uploading ${shortcode} to uguu.se...`);
     
-    // Try multiple hosting services
-    const hostingServices = [
-        {
-            name: 'tmpfiles.org',
-            url: 'https://tmpfiles.org/api/v1/upload',
-            method: 'tmpfiles'
-        },
-        {
-            name: 'transfer.sh', 
-            url: 'https://transfer.sh/',
-            method: 'transfer'
-        },
-        {
-            name: 'uguu.se',
-            url: 'https://uguu.se/upload.php',
-            method: 'uguu'
-        }
-    ];
-    
-    for (const service of hostingServices) {
-        try {
-            console.log(`📤 Trying ${service.name}...`);
-            const publicUrl = await uploadToService(videoPath, shortcode, service);
-            if (publicUrl) {
-                console.log(`✅ Successfully uploaded to ${service.name}: ${publicUrl.substring(0, 50)}...`);
-                return publicUrl;
-            }
-        } catch (error) {
-            console.log(`⚠️ ${service.name} failed: ${error.message}`);
-            continue;
-        }
-    }
-    
-    console.error(`❌ All hosting services failed for ${shortcode}`);
-    return null;
-}
-
-// Upload to specific hosting service
-async function uploadToService(videoPath, shortcode, service) {
     const FormData = require('form-data');
     const form = new FormData();
     
-    switch (service.method) {
-        case 'tmpfiles':
-            form.append('file', fs.createReadStream(videoPath));
-            const tmpResponse = await axios.post(service.url, form, {
-                headers: {
-                    ...form.getHeaders(),
-                    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
-                },
-                timeout: 60000
-            });
-            
-            if (tmpResponse.data && tmpResponse.data.status === 'success') {
-                return tmpResponse.data.data.url;
-            }
-            break;
-            
-        case 'transfer':
-            const transferResponse = await axios.put(
-                `${service.url}${shortcode}.mp4`,
-                fs.createReadStream(videoPath),
-                {
-                    headers: {
-                        'Content-Type': 'video/mp4',
-                        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
-                    },
-                    timeout: 60000,
-                    maxContentLength: Infinity,
-                    maxBodyLength: Infinity
-                }
-            );
-            
-            if (transferResponse.status === 200 && transferResponse.data) {
-                const url = transferResponse.data.trim();
-                if (url.startsWith('https://')) {
-                    return url;
-                }
-            }
-            break;
-            
-        case 'uguu':
-            form.append('files[]', fs.createReadStream(videoPath), {
-                filename: `${shortcode}.mp4`,
-                contentType: 'video/mp4'
-            });
-            
-            const uguuResponse = await axios.post(service.url, form, {
-                headers: {
-                    ...form.getHeaders(),
-                    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
-                },
-                timeout: 60000
-            });
-            
-            if (uguuResponse.data && uguuResponse.data.success) {
-                return uguuResponse.data.files[0].url;
-            }
-            break;
-    }
+    form.append('files[]', fs.createReadStream(videoPath), {
+        filename: `${shortcode}.mp4`,
+        contentType: 'video/mp4'
+    });
     
-    throw new Error(`${service.name} upload failed`);
+    try {
+        const response = await axios.post('https://uguu.se/upload.php', form, {
+            headers: {
+                ...form.getHeaders(),
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
+            },
+            timeout: 60000
+        });
+        
+        if (response.data && response.data.success) {
+            const publicUrl = response.data.files[0].url;
+            console.log(`✅ Successfully uploaded to uguu.se: ${publicUrl}`);
+            return publicUrl;
+        } else {
+            throw new Error('Upload response indicates failure');
+        }
+    } catch (error) {
+        console.error(`❌ uguu.se upload failed: ${error.message}`);
+        return null;
+    }
 }
+
+
 
 // Convert video to Instagram-compatible format
 async function convertVideoForInstagram(inputPath, shortcode) {
@@ -191,6 +332,36 @@ async function convertVideoForInstagram(inputPath, shortcode) {
             })
             .save(outputPath);
     });
+}
+
+// Clean up downloaded files after successful Instagram upload
+async function cleanupDownloadedFiles(shortcode, originalVideoPath, convertedVideoPath) {
+    try {
+        console.log(`🧹 Cleaning up downloaded files for ${shortcode}...`);
+        
+        // Delete original video file
+        if (fs.existsSync(originalVideoPath)) {
+            fs.unlinkSync(originalVideoPath);
+            console.log(`🗑️ Deleted original video: ${path.basename(originalVideoPath)}`);
+        }
+        
+        // Delete converted video file (if different from original)
+        if (convertedVideoPath && convertedVideoPath !== originalVideoPath && fs.existsSync(convertedVideoPath)) {
+            fs.unlinkSync(convertedVideoPath);
+            console.log(`🗑️ Deleted converted video: ${path.basename(convertedVideoPath)}`);
+        }
+        
+        // Delete debug files if they exist
+        const debugFile = path.join(REELS_FOLDER, `debug_${shortcode}.txt`);
+        if (fs.existsSync(debugFile)) {
+            fs.unlinkSync(debugFile);
+            console.log(`🗑️ Deleted debug file: debug_${shortcode}.txt`);
+        }
+        
+        console.log(`✅ Cleanup complete for ${shortcode}`);
+    } catch (error) {
+        console.error(`⚠️ Error during cleanup for ${shortcode}:`, error.message);
+    }
 }
 
 // Upload reel to Instagram using public URL
@@ -350,35 +521,12 @@ async function processReelWithUpload(url) {
             if (publicUrl) {
                 // Then upload to Instagram
                 const instagramResult = await uploadReelWithPublicURL(publicUrl, shortcode, caption);
-                if (!instagramResult) {
-                    console.log('⚠️ Instagram upload failed, trying alternative hosting...');
-                    // Try other hosting services
-                    const hostingServices = [
-                        { name: 'transfer.sh', method: 'transfer' },
-                        { name: 'uguu.se', method: 'uguu' }
-                    ];
-                    
-                    for (const service of hostingServices) {
-                        try {
-                            console.log(`📤 Trying alternative hosting: ${service.name}...`);
-                            const altUrl = await uploadToService(videoToUpload, shortcode, {
-                                name: service.name,
-                                url: service.name === 'transfer.sh' ? 'https://transfer.sh/' : 'https://uguu.se/upload.php',
-                                method: service.method
-                            });
-                            
-                            if (altUrl) {
-                                console.log(`✅ Uploaded to ${service.name}, trying Instagram again...`);
-                                const altResult = await uploadReelWithPublicURL(altUrl, shortcode, caption);
-                                if (altResult) {
-                                    console.log(`🎉 Success with ${service.name}!`);
-                                    break;
-                                }
-                            }
-                        } catch (altError) {
-                            console.log(`⚠️ ${service.name} failed: ${altError.message}`);
-                        }
-                    }
+                if (instagramResult) {
+                    console.log('🎉 Successfully uploaded to Instagram!');
+                    // Clean up downloaded files after successful upload
+                    await cleanupDownloadedFiles(shortcode, videoPath, videoToUpload);
+                } else {
+                    console.log('❌ Instagram upload failed');
                 }
             } else {
                 console.log('❌ Could not upload to public hosting, skipping Instagram upload...');
@@ -438,7 +586,7 @@ async function main() {
     console.log('\n🎉 Processing complete!');
     console.log(`✅ Successful: ${successCount}`);
     console.log(`❌ Failed: ${failCount}`);
-    console.log(`📂 Downloads saved to: ${REELS_FOLDER}`);
+    console.log(`🧹 Successfully uploaded files have been automatically cleaned up`);
     console.log(`📱 Check your @anime.skitz Instagram account!`);
 }
 
