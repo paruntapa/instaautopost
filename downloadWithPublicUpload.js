@@ -290,8 +290,6 @@ async function uploadToPublicHosting(videoPath, shortcode) {
     }
 }
 
-
-
 // Convert video to Instagram-compatible format
 async function convertVideoForInstagram(inputPath, shortcode) {
     return new Promise((resolve, reject) => {
@@ -332,6 +330,108 @@ async function convertVideoForInstagram(inputPath, shortcode) {
             })
             .save(outputPath);
     });
+}
+
+// Remove caption data from captions.json for a specific shortcode
+function removeCaptionData(shortcode) {
+    try {
+        const captionsFile = path.join(REELS_FOLDER, 'captions.json');
+        if (fs.existsSync(captionsFile)) {
+            let captions = {};
+            try {
+                captions = JSON.parse(fs.readFileSync(captionsFile, 'utf8'));
+                if (captions[shortcode]) {
+                    delete captions[shortcode];
+                    fs.writeFileSync(captionsFile, JSON.stringify(captions, null, 2));
+                    console.log(`🗑️ Removed caption data for ${shortcode}`);
+                }
+            } catch (e) {
+                console.log(`⚠️ Error removing caption data for ${shortcode}:`, e.message);
+            }
+        }
+    } catch (error) {
+        console.error(`⚠️ Error accessing captions file for ${shortcode}:`, error.message);
+    }
+}
+
+// Comprehensive cleanup for failed processing (removes all traces)
+async function cleanupFailedProcessing(shortcode, reason = 'processing failed') {
+    try {
+        console.log(`🧹 Cleaning up failed processing for ${shortcode} (${reason})...`);
+        
+        // Clean up video files
+        const originalVideoPath = path.join(REELS_FOLDER, `${shortcode}.mp4`);
+        const convertedVideoPath = path.join(REELS_FOLDER, `${shortcode}_converted.mp4`);
+        
+        if (fs.existsSync(originalVideoPath)) {
+            fs.unlinkSync(originalVideoPath);
+            console.log(`🗑️ Deleted original video: ${shortcode}.mp4`);
+        }
+        
+        if (fs.existsSync(convertedVideoPath)) {
+            fs.unlinkSync(convertedVideoPath);
+            console.log(`🗑️ Deleted converted video: ${shortcode}_converted.mp4`);
+        }
+        
+        // Clean up debug files
+        const debugFile = path.join(REELS_FOLDER, `debug_${shortcode}.txt`);
+        if (fs.existsSync(debugFile)) {
+            fs.unlinkSync(debugFile);
+            console.log(`🗑️ Deleted debug file: debug_${shortcode}.txt`);
+        }
+        
+        // Remove caption data from captions.json
+        removeCaptionData(shortcode);
+        
+        console.log(`✅ Cleanup complete for ${shortcode}`);
+    } catch (error) {
+        console.error(`⚠️ Error during failed processing cleanup for ${shortcode}:`, error.message);
+    }
+}
+
+// Clean up all existing files from previous runs (optional startup cleanup)
+async function cleanupAllExistingFiles() {
+    try {
+        console.log(`🧹 Cleaning up all existing files from previous runs...`);
+        
+        if (!fs.existsSync(REELS_FOLDER)) {
+            console.log(`📁 Reels folder doesn't exist, nothing to clean`);
+            return;
+        }
+        
+        const files = fs.readdirSync(REELS_FOLDER);
+        let cleanedCount = 0;
+        
+        for (const file of files) {
+            const filePath = path.join(REELS_FOLDER, file);
+            
+            // Remove video files (.mp4)
+            if (file.endsWith('.mp4')) {
+                fs.unlinkSync(filePath);
+                console.log(`🗑️ Deleted video file: ${file}`);
+                cleanedCount++;
+            }
+            
+            // Remove debug files (debug_*.txt)
+            if (file.startsWith('debug_') && file.endsWith('.txt')) {
+                fs.unlinkSync(filePath);
+                console.log(`🗑️ Deleted debug file: ${file}`);
+                cleanedCount++;
+            }
+        }
+        
+        // Clear captions.json
+        const captionsFile = path.join(REELS_FOLDER, 'captions.json');
+        if (fs.existsSync(captionsFile)) {
+            fs.writeFileSync(captionsFile, '{}');
+            console.log(`🗑️ Cleared captions.json`);
+            cleanedCount++;
+        }
+        
+        console.log(`✅ Cleanup complete - removed ${cleanedCount} files/entries`);
+    } catch (error) {
+        console.error(`⚠️ Error during full cleanup:`, error.message);
+    }
 }
 
 // Clean up downloaded files after successful Instagram upload
@@ -470,11 +570,14 @@ async function uploadReelWithPublicURL(publicVideoUrl, shortcode, originalCaptio
 
 // Enhanced process function with public URL upload
 async function processReelWithUpload(url) {
+    let shortcode = null;
+    let captionSaved = false;
+    
     try {
         console.log(`\n🔄 Processing: ${url}`);
         
         // Extract shortcode
-        const shortcode = extractShortcode(url);
+        shortcode = extractShortcode(url);
         if (!shortcode) {
             console.log('❌ Could not extract shortcode, skipping...');
             return false;
@@ -486,6 +589,7 @@ async function processReelWithUpload(url) {
         const videoData = await getVideoDataFromPage(shortcode);
         if (!videoData || !videoData.videoUrl) {
             console.log('❌ Could not get video data, skipping...');
+            await cleanupFailedProcessing(shortcode, 'failed to get video data');
             return false;
         }
         
@@ -494,11 +598,13 @@ async function processReelWithUpload(url) {
         
         // Save caption data
         saveCaptionData(shortcode, caption, url);
+        captionSaved = true;
         
         // Download video
         const videoPath = await downloadVideo(videoUrl, shortcode);
         if (!videoPath) {
             console.log('❌ Could not download video, skipping...');
+            await cleanupFailedProcessing(shortcode, 'failed to download video');
             return false;
         }
         
@@ -527,16 +633,27 @@ async function processReelWithUpload(url) {
                     await cleanupDownloadedFiles(shortcode, videoPath, videoToUpload);
                 } else {
                     console.log('❌ Instagram upload failed');
+                    await cleanupFailedProcessing(shortcode, 'failed to upload to Instagram');
+                    return false;
                 }
             } else {
                 console.log('❌ Could not upload to public hosting, skipping Instagram upload...');
+                await cleanupFailedProcessing(shortcode, 'failed to upload to public hosting');
+                return false;
             }
+        } else {
+            console.log('⚠️ No Instagram API credentials, keeping files but marking as incomplete');
+            // If no Instagram credentials, we still keep it as successful processing
+            // since the download and conversion worked, just can't upload to Instagram
         }
         
         return true;
         
     } catch (error) {
         console.error(`💥 Error processing ${url}:`, error.message);
+        if (shortcode) {
+            await cleanupFailedProcessing(shortcode, 'unexpected error during processing');
+        }
         return false;
     }
 }
@@ -545,6 +662,13 @@ async function processReelWithUpload(url) {
 async function main() {
     console.log('🚀 Starting Enhanced Instagram Reel Processor...');
     console.log('📤 Now with automatic Instagram uploads via public URLs!\n');
+    
+    // Check if user wants to clean up existing files
+    const shouldCleanup = process.argv.includes('--cleanup') || process.env.CLEANUP_ON_START === 'true';
+    if (shouldCleanup) {
+        await cleanupAllExistingFiles();
+        console.log('');
+    }
     
     // Ensure reels folder exists
     if (!fs.existsSync(REELS_FOLDER)) {
@@ -587,7 +711,8 @@ async function main() {
     console.log(`✅ Successful: ${successCount}`);
     console.log(`❌ Failed: ${failCount}`);
     console.log(`🧹 Successfully uploaded files have been automatically cleaned up`);
-    console.log(`📱 Check your @anime.skitz Instagram account!`);
+    console.log(`🗑️ Failed processing files have been automatically cleaned up`);
+    console.log(`📱 Check your ${IG_USER_ID} Instagram account!`);
 }
 
 // Run the enhanced script
@@ -601,5 +726,8 @@ if (require.main === module) {
 module.exports = {
     uploadToPublicHosting,
     uploadReelWithPublicURL,
-    processReelWithUpload
+    processReelWithUpload,
+    cleanupFailedProcessing,
+    cleanupAllExistingFiles,
+    removeCaptionData
 }; 
